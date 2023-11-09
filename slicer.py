@@ -1,146 +1,161 @@
-import librosa
+import os
+import soundfile as sf
 import torch
 import torchaudio
 
 
-class Slicer:
-    def __init__(self,
-                 sr: int,
-                 threshold: float = -40.,
-                 min_length: int = 5000,
-                 min_interval: int = 300,
-                 hop_size: int = 20,
-                 max_sil_kept: int = 5000):
-        if not min_length >= min_interval >= hop_size:
-            raise ValueError('The following condition must be satisfied: min_length >= min_interval >= hop_size')
-        if not max_sil_kept >= hop_size:
-            raise ValueError('The following condition must be satisfied: max_sil_kept >= hop_size')
-        min_interval = sr * min_interval / 1000
-        self.threshold = 10 ** (threshold / 20.)
-        self.hop_size = round(sr * hop_size / 1000)
-        self.win_size = min(round(min_interval), 4 * self.hop_size)
-        self.min_length = round(sr * min_length / 1000 / self.hop_size)
-        self.min_interval = round(min_interval / self.hop_size)
-        self.max_sil_kept = round(sr * max_sil_kept / 1000 / self.hop_size)
+def read_audio(path):
+    wav, sr = torchaudio.load(path)
 
-    def _apply_slice(self, waveform, begin, end):
-        if len(waveform.shape) > 1:
-            return waveform[:, begin * self.hop_size: min(waveform.shape[1], end * self.hop_size)]
-        else:
-            return waveform[begin * self.hop_size: min(waveform.shape[0], end * self.hop_size)]
+    if wav.size(0) > 1:
+        wav = wav.mean(dim=0, keepdim=True)
 
-    # @timeit
-    def slice(self, waveform):
-        if len(waveform.shape) > 1:
-            samples = librosa.to_mono(waveform)
-        else:
-            samples = waveform
-        if samples.shape[0] <= self.min_length:
-            return {"0": {"slice": False, "split_time": f"0,{len(waveform)}"}}
-        rms_list = librosa.feature.rms(y=samples, frame_length=self.win_size, hop_length=self.hop_size).squeeze(0)
-        sil_tags = []
-        silence_start = None
-        clip_start = 0
-        for i, rms in enumerate(rms_list):
-            # Keep looping while frame is silent.
-            if rms < self.threshold:
-                # Record start of silent frames.
-                if silence_start is None:
-                    silence_start = i
-                continue
-            # Keep looping while frame is not silent and silence start has not been recorded.
-            if silence_start is None:
-                continue
-            # Clear recorded silence start if interval is not enough or clip is too short
-            is_leading_silence = silence_start == 0 and i > self.max_sil_kept
-            need_slice_middle = i - silence_start >= self.min_interval and i - clip_start >= self.min_length
-            if not is_leading_silence and not need_slice_middle:
-                silence_start = None
-                continue
-            # Need slicing. Record the range of silent frames to be removed.
-            if i - silence_start <= self.max_sil_kept:
-                pos = rms_list[silence_start: i + 1].argmin() + silence_start
-                if silence_start == 0:
-                    sil_tags.append((0, pos))
-                else:
-                    sil_tags.append((pos, pos))
-                clip_start = pos
-            elif i - silence_start <= self.max_sil_kept * 2:
-                pos = rms_list[i - self.max_sil_kept: silence_start + self.max_sil_kept + 1].argmin()
-                pos += i - self.max_sil_kept
-                pos_l = rms_list[silence_start: silence_start + self.max_sil_kept + 1].argmin() + silence_start
-                pos_r = rms_list[i - self.max_sil_kept: i + 1].argmin() + i - self.max_sil_kept
-                if silence_start == 0:
-                    sil_tags.append((0, pos_r))
-                    clip_start = pos_r
-                else:
-                    sil_tags.append((min(pos_l, pos), max(pos_r, pos)))
-                    clip_start = max(pos_r, pos)
-            else:
-                pos_l = rms_list[silence_start: silence_start + self.max_sil_kept + 1].argmin() + silence_start
-                pos_r = rms_list[i - self.max_sil_kept: i + 1].argmin() + i - self.max_sil_kept
-                if silence_start == 0:
-                    sil_tags.append((0, pos_r))
-                else:
-                    sil_tags.append((pos_l, pos_r))
-                clip_start = pos_r
-            silence_start = None
-        # Deal with trailing silence.
-        total_frames = rms_list.shape[0]
-        if silence_start is not None and total_frames - silence_start >= self.min_interval:
-            silence_end = min(total_frames, silence_start + self.max_sil_kept)
-            pos = rms_list[silence_start: silence_end + 1].argmin() + silence_start
-            sil_tags.append((pos, total_frames + 1))
-        # Apply and return slices.
-        if len(sil_tags) == 0:
-            return {"0": {"slice": False, "split_time": f"0,{len(waveform)}"}}
-        else:
-            chunks = []
-            # 第一段静音并非从头开始，补上有声片段
-            if sil_tags[0][0]:
-                chunks.append(
-                    {"slice": False, "split_time": f"0,{min(waveform.shape[0], sil_tags[0][0] * self.hop_size)}"})
-            for i in range(0, len(sil_tags)):
-                # 标识有声片段（跳过第一段）
-                if i:
-                    chunks.append({"slice": False,
-                                   "split_time": f"{sil_tags[i - 1][1] * self.hop_size},{min(waveform.shape[0], sil_tags[i][0] * self.hop_size)}"})
-                # 标识所有静音片段
-                chunks.append({"slice": True,
-                               "split_time": f"{sil_tags[i][0] * self.hop_size},{min(waveform.shape[0], sil_tags[i][1] * self.hop_size)}"})
-            # 最后一段静音并非结尾，补上结尾片段
-            if sil_tags[-1][1] * self.hop_size < len(waveform):
-                chunks.append({"slice": False, "split_time": f"{sil_tags[-1][1] * self.hop_size},{len(waveform)}"})
-            chunk_dict = {}
-            for i in range(len(chunks)):
-                chunk_dict[str(i)] = chunks[i]
-            return chunk_dict
+    return wav.squeeze(0), sr
 
+def resample_wav(wav, sr, new_sr):
+    wav = wav.unsqueeze(0)
+    transform = torchaudio.transforms.Resample(orig_freq=sr, new_freq=new_sr)
+    wav = transform(wav)
+    return wav.squeeze(0)
 
-def cut(audio_path, db_thresh=-30, min_len=5000, flask_mode=False, flask_sr=None):
-    if not flask_mode:
-        audio, sr = librosa.load(audio_path, sr=None)
+def map_timestamps_to_new_sr(vad_sr, new_sr, timestamps, just_begging_end=False):
+    factor = new_sr / vad_sr
+    new_timestamps = []
+    if just_begging_end and timestamps:
+        # get just the start and end timestamps
+        new_dict = {"start": int(timestamps[0]["start"] * factor), "end": int(timestamps[-1]["end"] * factor)}
+        new_timestamps.append(new_dict)
     else:
-        audio = audio_path
-        sr = flask_sr
-    slicer = Slicer(
-        sr=sr,
-        threshold=db_thresh,
-        min_length=min_len
+        for ts in timestamps:
+            # map to the new SR
+            new_dict = {"start": int(ts["start"] * factor), "end": int(ts["end"] * factor)}
+            new_timestamps.append(new_dict)
+
+    return new_timestamps
+
+def get_vad_model_and_utils(use_cuda=False):
+    model, utils = torch.hub.load(repo_or_dir="snakers4/silero-vad", model="silero_vad", onnx=False)
+    if use_cuda:
+        model = model.cuda()
+
+    get_speech_timestamps, save_audio, _, _, collect_chunks = utils
+    return model, get_speech_timestamps, save_audio, collect_chunks
+
+class AudioVADSlicer:
+
+    def __init__(self, device, min_sec=1, max_sec=10, threshold=0.9, out_dir=None, vad_sample_rate=8000):
+        self.use_cuda = True if device=="cuda" else False
+        self.model_and_utils = get_vad_model_and_utils(use_cuda=self.use_cuda)
+        self.vad_sample_rate = vad_sample_rate
+        self.out_dir = out_dir
+        self.min_sec = min_sec
+        self.max_sec = max_sec
+        self.threshold = threshold
+
+    def get_new_speech_timestamps(self, audio_path, trim_just_beginning_and_end=False):
+        # get the VAD model and utils functions
+        model, get_speech_timestamps, _, collect_chunks = self.model_and_utils
+
+        # read ground truth wav and resample the audio for the VAD
+        orig_wav, orig_sample_rate = read_audio(audio_path)
+
+        # if needed, resample the audio for the VAD model
+        if orig_sample_rate != self.vad_sample_rate:
+            wav = resample_wav(orig_wav, orig_sample_rate, self.vad_sample_rate)
+        else:
+            wav = orig_wav
+
+        if self.use_cuda:
+            wav = wav.cuda()
+
+        # get speech timestamps from full audio file
+        speech_timestamps = get_speech_timestamps(
+            wav, model, sampling_rate=self.vad_sample_rate, window_size_samples=768, threshold=self.threshold
+        )
+
+        # map the current speech_timestamps to the sample rate of the ground truth audio
+        new_speech_timestamps = map_timestamps_to_new_sr(
+            self.vad_sample_rate, orig_sample_rate, speech_timestamps, trim_just_beginning_and_end
+        )
+        
+        return orig_wav, orig_sample_rate, new_speech_timestamps
+
+    def __call__(self, audio_path, out_dir=None):
+        if not out_dir and self.out_dir:
+            out_dir = self.out_dir
+        
+        orig_wav, orig_sample_rate, new_timestamps = self.get_new_speech_timestamps(audio_path)
+        orig_wav = orig_wav.cpu().numpy()
+        
+        segments = []
+        for tp in new_timestamps:
+            s = tp["start"]
+            e = tp["end"]
+
+            if out_dir:
+                prefix = os.path.splitext(os.path.basename(audio_path))[0]
+                os.makedirs(os.path.join(out_dir, prefix), exist_ok=True)
+                out_path = os.path.join(out_dir, prefix, f"{prefix}_{s}_{e}.wav")
+                if (e-s)//orig_sample_rate < self.min_sec:
+                    print(f"Ignoring {e//orig_sample_rate}:{s//orig_sample_rate} (< {self.min_sec})")            
+                elif (e-s)//orig_sample_rate > self.max_sec:
+                    print(f"Ignoring {e//orig_sample_rate}:{s//orig_sample_rate} (> {self.max_sec})")
+                else:
+                    print(f"Saving audio {out_path}")
+                    sf.write(file=out_path, data=orig_wav[s:e], samplerate=orig_sample_rate, subtype="PCM_16")
+            segments.append(orig_wav[s:e])
+        return segments, orig_sample_rate
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--files", nargs="+")
+    parser.add_argument("--dir")
+    parser.add_argument("--out-dir", '-o', required=True)
+    parser.add_argument("--threshold", type=float, default=0.9)
+    parser.add_argument("--min-sec", type=float, default=0.5)
+    parser.add_argument("--max-sec", type=float, default=8.0)
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
+    args = parser.parse_args()
+
+    if not args.files and not args.dir:
+        raise ValueError("Must specify either files or dir")
+
+    slicer = AudioVADSlicer(
+        device=args.device, 
+        out_dir=args.out_dir, 
+        min_sec=args.min_sec, 
+        max_sec=args.max_sec, 
+        threshold=args.threshold
     )
-    chunks = slicer.slice(audio)
-    return chunks
 
-
-def chunks2audio(audio_path, chunks):
-    chunks = dict(chunks)
-    audio, sr = torchaudio.load(audio_path)
-    if len(audio.shape) == 2 and audio.shape[1] >= 2:
-        audio = torch.mean(audio, dim=0).unsqueeze(0)
-    audio = audio.cpu().numpy()[0]
-    result = []
-    for k, v in chunks.items():
-        tag = v["split_time"].split(",")
-        if tag[0] != tag[1]:
-            result.append((v["slice"], audio[int(tag[0]):int(tag[1])]))
-    return result, sr
+    if args.files:
+        for file in args.files:
+            print('>', file)
+            save_dir = os.path.join(args.out_dir, os.path.splitext(os.path.basename(file))[0])
+            print("Saving to", save_dir)
+            if args.skip_existing and os.path.isdir(save_dir):
+                print("Skipping", save_dir)
+                continue
+            try:
+                slicer(file)
+            except Exception as e:
+                print("Error:", e, file=sys.stderr)
+    elif args.dir:
+        for spk_dir in os.listdir(args.dir): 
+            for root, subfolders, files in os.walk(os.path.join(args.dir, spk_dir)):
+                for file in list(filter(lambda f: f.endswith('wav'), files)):
+                    fp = os.path.join(root, file)
+                    print('>', fp)
+                    save_dir = os.path.join(args.out_dir, os.path.basename(spk_dir))
+                    if args.skip_existing and os.path.exists(save_dir):
+                        print("Skipping", save_dir)
+                        continue
+                    print("Saving to", save_dir)
+                    try:
+                        slicer(fp, out_dir=save_dir)
+                    except Exception as e:
+                        print("Error:", e, file=sys.stderr)
