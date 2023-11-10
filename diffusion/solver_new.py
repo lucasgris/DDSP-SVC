@@ -175,7 +175,7 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
                 })
             
             # validation
-            if saver.global_step % args.train.interval_val == 0:
+            if saver.global_step % args.train.interval_val == 0 or (epoch == args.train.epochs - 1):
                 optimizer_save = optimizer if args.train.save_opt else None
                 
                 # save latest
