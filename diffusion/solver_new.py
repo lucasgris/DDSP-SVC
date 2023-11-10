@@ -203,4 +203,6 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
                 
                 model.train()
 
+            if epoch == args.train.epochs - 1:
+                break
                           
