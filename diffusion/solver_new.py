@@ -151,7 +151,7 @@ def train(args, initial_global_step, model, optimizer, scheduler, vocoder, loade
                 scheduler.step()
                 
             # log loss
-            if saver.global_step % args.train.interval_log == 0:
+            if saver.global_step % args.train.interval_log == 0 or (epoch == args.train.epochs - 1):
                 current_lr =  optimizer.param_groups[0]['lr']
                 saver.log_info(
                     'epoch: {} | {:3d}/{:3d} | {} | batch/s: {:.2f} | lr: {:.6} | loss: {:.3f} | time: {} | step: {}'.format(
