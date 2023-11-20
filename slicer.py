@@ -103,8 +103,13 @@ class AudioVADSlicer:
                 else:
                     print(f"Saving audio {out_path}")
                     sf.write(file=out_path, data=orig_wav[s:e], samplerate=orig_sample_rate, subtype="PCM_16")
-            segments.append(orig_wav[s:e])
-        return segments, orig_sample_rate
+            segments.append({
+                "audio": orig_wav[s:e],
+                "sample_rate": orig_sample_rate,
+                "start": s,
+                "end": e,
+            })
+        return segments
 
 if __name__ == "__main__":
     import argparse
